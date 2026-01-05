@@ -260,7 +260,7 @@ export async function hasChildPagesOrDatabases(
  */
 export function extractPageTitle(page: PageObjectResponse): string {
 	const properties = page.properties;
-	
+
 	// Try to find title property
 	for (const key in properties) {
 		const prop = properties[key];
@@ -268,8 +268,65 @@ export function extractPageTitle(page: PageObjectResponse): string {
 			return prop.title.map(t => t.plain_text).join('');
 		}
 	}
-	
+
 	return 'Untitled';
+}
+
+/**
+ * Find the real content edit time from block timestamps
+ * When Notion integration access corrupts page timestamps, we can recover
+ * the real last edit time by scanning block timestamps.
+ *
+ * @param blocks - Array of blocks to scan
+ * @param corruptionDate - Date when integration was connected (timestamps after this are suspect)
+ * @param client - Notion client for fetching nested blocks
+ * @param ctx - Import context
+ * @param blocksCache - Cache of already-fetched blocks
+ * @returns The newest block timestamp before the corruption date, or null if none found
+ */
+export async function findRealContentEditTime(
+	blocks: BlockObjectResponse[],
+	corruptionDate: Date,
+	client: Client,
+	ctx: ImportContext,
+	blocksCache?: Map<string, BlockObjectResponse[]>
+): Promise<string | null> {
+	// Track the newest valid timestamp as a number for easier comparison
+	let newestValidTimeMs = 0;
+	let newestValidTimeStr = '';
+
+	async function scanBlocks(blocksToScan: BlockObjectResponse[]): Promise<void> {
+		for (const block of blocksToScan) {
+			if (ctx.isCancelled()) return;
+
+			// Check this block's timestamp
+			if (block.last_edited_time) {
+				const blockTime = new Date(block.last_edited_time);
+				const blockTimeMs = blockTime.getTime();
+				// Only consider timestamps before the corruption date
+				if (blockTime < corruptionDate && blockTimeMs > newestValidTimeMs) {
+					newestValidTimeMs = blockTimeMs;
+					newestValidTimeStr = block.last_edited_time;
+				}
+			}
+
+			// Recursively scan nested blocks
+			if (block.has_children) {
+				try {
+					const children = await getBlockChildren(block.id, client, ctx, blocksCache);
+					await scanBlocks(children);
+				}
+				catch (error) {
+					// Continue scanning other blocks if one fails
+					console.warn(`Failed to scan children of block ${block.id}:`, error);
+				}
+			}
+		}
+	}
+
+	await scanBlocks(blocks);
+
+	return newestValidTimeStr || null;
 }
 
 /**
@@ -297,6 +354,8 @@ export interface ExtractFrontMatterParams {
 	incrementalImport?: boolean;
 	onAttachmentDownloaded?: () => void;
 	getAvailableAttachmentPath?: (filename: string) => Promise<string>;
+	// Real content edit time recovered from block timestamps (when page timestamp is corrupted)
+	contentUpdated?: string;
 }
 
 /**
@@ -307,27 +366,42 @@ export interface ExtractFrontMatterParams {
 export async function extractFrontMatter(
 	params: ExtractFrontMatterParams
 ): Promise<Record<string, any>> {
-	const { 
-		page, 
-		formulaStrategy = 'hybrid', 
-		databaseProperties, 
-		client, 
-		ctx 
+	const {
+		page,
+		formulaStrategy = 'hybrid',
+		databaseProperties,
+		client,
+		ctx,
+		contentUpdated
 	} = params;
 	// Using 'any' for frontMatter values because page properties have many different types
 	const frontMatter: Record<string, any> = {
 		'notion-id': page.id,
 	};
-	
-	// Note: created_time and last_edited_time are not added to frontmatter
-	// Users can enable these if needed by uncommenting the code below
-	// if (page.created_time) {
-	// 	frontMatter.created = page.created_time;
-	// }
-	// if (page.last_edited_time) {
-	// 	frontMatter.updated = page.last_edited_time;
-	// }
-	
+
+	// Add all available page metadata to frontmatter
+	if (page.created_time) {
+		frontMatter.created = convertNotionDateToObsidian(page.created_time);
+	}
+	if (page.last_edited_time) {
+		frontMatter.updated = convertNotionDateToObsidian(page.last_edited_time);
+	}
+	// Add recovered content edit time if page timestamp was corrupted
+	if (contentUpdated) {
+		frontMatter.content_updated = convertNotionDateToObsidian(contentUpdated);
+	}
+	if (page.created_by) {
+		frontMatter.created_by = extractUserInfo(page.created_by);
+	}
+	if (page.last_edited_by) {
+		frontMatter.updated_by = extractUserInfo(page.last_edited_by);
+	}
+
+	// Add Notion URL for reference back to original
+	if (page.url) {
+		frontMatter.source = page.url;
+	}
+
 	// Add cover if present (will be processed as attachment later)
 	if (page.cover) {
 		frontMatter.cover = extractCoverUrl(page.cover);
@@ -394,14 +468,36 @@ export async function extractFrontMatter(
  */
 function extractCoverUrl(cover: PageObjectResponse['cover']): string | null {
 	if (!cover) return null;
-	
+
 	if (cover.type === 'external' && cover.external?.url) {
 		return cover.external.url;
 	}
 	else if (cover.type === 'file' && cover.file?.url) {
 		return cover.file.url;
 	}
-	
+
+	return null;
+}
+
+/**
+ * Extract user information from a Notion user object
+ * Returns name if available, otherwise email, otherwise ID
+ * @param user - Notion user object (created_by or last_edited_by)
+ */
+function extractUserInfo(user: any): string | null {
+	if (!user) return null;
+
+	// Priority: name > email > id
+	if (user.name) {
+		return user.name;
+	}
+	if (user.type === 'person' && user.person?.email) {
+		return user.person.email;
+	}
+	if (user.id) {
+		return user.id;
+	}
+
 	return null;
 }
 

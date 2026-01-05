@@ -7,12 +7,13 @@ import { parseFilePath } from '../filesystem';
 
 // Import helper modules
 import { createPlaceholder, PlaceholderType } from './notion-api/utils';
-import { 
-	makeNotionRequest, 
-	fetchAllBlocks, 
-	extractPageTitle, 
+import {
+	makeNotionRequest,
+	fetchAllBlocks,
+	extractPageTitle,
 	extractFrontMatter,
-	hasChildPagesOrDatabases
+	hasChildPagesOrDatabases,
+	findRealContentEditTime
 } from './notion-api/api-helpers';
 import { convertBlocksToMarkdown } from './notion-api/block-converter';
 import { getUniqueFolderPath, getUniqueFilePath } from './notion-api/vault-helpers';
@@ -50,6 +51,7 @@ export class NotionAPIImporter extends FormatImporter {
 	coverPropertyName: string = 'cover'; // Custom property name for page cover
 	databasePropertyName: string = 'base'; // Property name for linking pages to their database
 	incrementalImport: boolean = false; // Incremental import: skip files with same notion-id (default: disabled)
+	timestampCorrectionDate: Date | null = null; // Date when integration was connected (for timestamp corruption fix)
 	private notionClient: Client | null = null;
 	private processedPages: Set<string> = new Set();
 	private requestCount: number = 0;
@@ -193,6 +195,24 @@ export class NotionAPIImporter extends FormatImporter {
 					this.incrementalImport = value;
 				}));
 
+		// Timestamp correction setting
+		new Setting(this.modal.contentEl)
+			.setName('Timestamp correction date')
+			.setDesc(this.createTimestampCorrectionDescription())
+			.addText(text => text
+				.setPlaceholder('YYYY-MM-DD')
+				.onChange(value => {
+					if (value.trim() === '') {
+						this.timestampCorrectionDate = null;
+					}
+					else {
+						const date = new Date(value.trim());
+						if (!isNaN(date.getTime())) {
+							this.timestampCorrectionDate = date;
+						}
+					}
+				}));
+
 		// Formula import strategy
 		new Setting(this.modal.contentEl)
 			.setName('Convert formulas')
@@ -267,6 +287,14 @@ export class NotionAPIImporter extends FormatImporter {
 	private createFormulaStrategyDescription(): DocumentFragment {
 		const frag = document.createDocumentFragment();
 		frag.appendText('By default Notion formulas are converted to Obsidian syntax. If any Notion syntax is not supported the static values will be saved instead. Alternatively you can import all formulas as static values.');
+		return frag;
+	}
+
+	private createTimestampCorrectionDescription(): DocumentFragment {
+		const frag = document.createDocumentFragment();
+		frag.appendText('When you connect a Notion integration, page timestamps may get corrupted. Enter the date you connected the integration (YYYY-MM-DD) to recover real edit times from block timestamps. ');
+		frag.createEl('br');
+		frag.appendText('Leave empty to use page timestamps as-is.');
 		return frag;
 	}
 
@@ -1289,9 +1317,27 @@ export class NotionAPIImporter extends FormatImporter {
 				}
 			);
 			
+			// Calculate real content edit time if timestamp correction is enabled
+			// and the page's last_edited_time is after the corruption date
+			// This must be done BEFORE clearing the cache
+			let contentUpdated: string | undefined;
+			if (this.timestampCorrectionDate && page.last_edited_time) {
+				const pageEditTime = new Date(page.last_edited_time);
+				if (pageEditTime >= this.timestampCorrectionDate) {
+					// Page timestamp is suspect - scan blocks for real edit time
+					contentUpdated = await findRealContentEditTime(
+						blocks,
+						this.timestampCorrectionDate,
+						this.notionClient!,
+						ctx,
+						blocksCache
+					) || undefined;
+				}
+			}
+
 			// Clear the cache after processing this page to free memory
 			blocksCache.clear();
- 			
+
 			// Prepare YAML frontmatter
 			// Start with notion-id and database link at the top
 			const frontMatter: Record<string, any> = {
@@ -1302,7 +1348,7 @@ export class NotionAPIImporter extends FormatImporter {
 			if (databaseTag) {
 				frontMatter[this.databasePropertyName] = `[[${databaseTag}]]`;
 			}
-		
+
 			// Extract all other properties from the page
 			const extractedProps = await extractFrontMatter({
 				page,
@@ -1322,7 +1368,8 @@ export class NotionAPIImporter extends FormatImporter {
 				},
 				getAvailableAttachmentPath: async (filename: string) => {
 					return await this.getAvailablePathForAttachment(filename, []);
-				}
+				},
+				contentUpdated
 			});
 			// Merge extracted properties (skip notion-id as we already added it)
 			for (const key in extractedProps) {
